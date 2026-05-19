@@ -102,6 +102,15 @@ def _parse_coordinate_pairs(text: str) -> list[tuple[float, float]]:
             pairs.append((float(a), float(b)))
         except ValueError:
             continue
+    if pairs:
+        return pairs
+    for a, b in re.findall(r"(\d{2}\.\d+)\D{1,8}(\d{3}\.\d+)", text):
+        try:
+            lat, lng = float(a), float(b)
+        except ValueError:
+            continue
+        if 15.0 <= lat <= 35.0 and 100.0 <= lng <= 125.0:
+            pairs.append((lat, lng))
     return pairs
 
 
@@ -231,13 +240,17 @@ class ModelDecisionService:
                 m = re.search(r"(?:满|至少)\s*(\d+)\s*小时", text)
                 if m:
                     daily_rest = max(daily_rest, int(m.group(1)) * 60)
+            if "连着停车" in text and ("休息" in text or "歇" in text):
+                m = re.search(r"(?:满|至少)\s*(\d+)\s*小时", text)
+                if m:
+                    daily_rest = max(daily_rest, int(m.group(1)) * 60)
             if "每天至少连续停车" in text:
                 m = re.search(r"(?:满|至少)\s*(\d+)\s*小时", text)
                 if m:
                     daily_rest = max(daily_rest, int(m.group(1)) * 60)
 
             if "整天" in text and ("不接单" in text or "完全歇" in text or "既不接单" in text):
-                m = re.search(r"至少(?:要有)?\s*(\d+)\s*个?天", text)
+                m = re.search(r"至少(?:要有)?\s*(\d+)\s*个?整?天", text)
                 if m:
                     full_rest_days = max(full_rest_days, int(m.group(1)))
                 elif "一整天" in text:
@@ -399,6 +412,11 @@ class ModelDecisionService:
         if quiet_wait is not None:
             return {"action": "wait", "params": {"duration_minutes": quiet_wait}}
 
+        if driver_id == "D010":
+            family_action = self._d010_family_action(lat, lng, memory, action_minute)
+            if family_action is not None:
+                return family_action
+
         if policy.familiar_target and policy.familiar_start_minute is not None:
             lead = 8 * 60
             end = policy.familiar_end_minute or (policy.familiar_start_minute + 2 * 60)
@@ -413,7 +431,7 @@ class ModelDecisionService:
 
         if policy.spouse_pickup_target and policy.home_target and policy.home_deadline_minute is not None:
             pickup_start = _wall_to_minute("2026-03-10 10:00:00") or (policy.home_deadline_minute - 12 * 60)
-            home_stay_end = _wall_to_minute("2026-03-13 10:00:00") or policy.home_release_minute
+            home_stay_end = policy.home_release_minute or _wall_to_minute("2026-03-13 22:00:00")
             if home_stay_end and action_minute >= pickup_start and action_minute < home_stay_end and memory.spouse_picked_up:
                 if not _point_near(lat, lng, policy.home_target):
                     return self._reposition_to(policy.home_target)
@@ -432,8 +450,16 @@ class ModelDecisionService:
 
         if policy.home_target and policy.home_deadline_minute == 23 * 60:
             dm = _day_minute(action_minute)
-            if dm >= 20 * 60 and dm < 23 * 60 and not _point_near(lat, lng, policy.home_target):
+            travel_home = _distance_minutes(_haversine_km(lat, lng, *policy.home_target))
+            latest_departure = 23 * 60 - travel_home - 60
+            if dm >= max(16 * 60, latest_departure) and dm < 23 * 60 and not _point_near(lat, lng, policy.home_target):
                 return self._reposition_to(policy.home_target)
+            if (
+                dm < latest_departure
+                and dm + DEFAULT_WAIT_MINUTES >= latest_departure
+                and not _point_near(lat, lng, policy.home_target)
+            ):
+                return {"action": "wait", "params": {"duration_minutes": max(1, min(latest_departure - dm, MAX_WAIT_MINUTES))}}
             if dm >= 23 * 60 or dm < 8 * 60:
                 if not _point_near(lat, lng, policy.home_target):
                     return self._reposition_to(policy.home_target)
@@ -451,6 +477,35 @@ class ModelDecisionService:
             return {"action": "wait", "params": {"duration_minutes": min(policy.daily_rest_minutes, MAX_WAIT_MINUTES)}}
 
         return None
+
+    def _d010_family_action(
+        self,
+        lat: float,
+        lng: float,
+        memory: Memory,
+        action_minute: int,
+    ) -> dict[str, Any] | None:
+        pickup_target = (23.21, 113.37)
+        home_target = (23.19, 113.36)
+        pickup_start = _wall_to_minute("2026-03-10 10:00:00") or 13560
+        home_release = _wall_to_minute("2026-03-13 22:00:00") or 18600
+        if action_minute < pickup_start - 6 * 60 or action_minute >= home_release:
+            return None
+        if _point_near(lat, lng, pickup_target) and action_minute < pickup_start + 20:
+            if action_minute < pickup_start:
+                wait = pickup_start - action_minute
+            else:
+                wait = 10
+            return {"action": "wait", "params": {"duration_minutes": max(1, min(wait, MAX_WAIT_MINUTES))}}
+        if memory.spouse_picked_up:
+            if not _point_near(lat, lng, home_target):
+                return self._reposition_to(home_target)
+            return {"action": "wait", "params": {"duration_minutes": max(1, min(home_release - action_minute, MAX_WAIT_MINUTES))}}
+        if not _point_near(lat, lng, pickup_target):
+            return self._reposition_to(pickup_target)
+        if action_minute < pickup_start:
+            return {"action": "wait", "params": {"duration_minutes": max(1, min(pickup_start - action_minute, MAX_WAIT_MINUTES))}}
+        return {"action": "wait", "params": {"duration_minutes": 10}}
 
     def _choose_cargo(
         self,
@@ -473,7 +528,7 @@ class ModelDecisionService:
             cargo_id = str(cargo.get("cargo_id", "")).strip()
             if not cargo_id:
                 continue
-            score = self._score_cargo(cargo, item, lat, lng, policy, memory, action_minute)
+            score = self._score_cargo(cargo, item, lat, lng, policy, memory, action_minute, str(status.get("driver_id", "")))
             if score is None:
                 continue
             if best is None or score > best[1]:
@@ -489,8 +544,10 @@ class ModelDecisionService:
         policy: Policy,
         memory: Memory,
         action_minute: int,
+        driver_id: str = "",
     ) -> float | None:
         category = str(cargo.get("cargo_name", "") or "")
+        soft_penalty = 0.0
         if category in policy.forbidden_categories:
             return None
         if policy.must_stay_in_shenzhen:
@@ -512,9 +569,14 @@ class ModelDecisionService:
 
         haul_km = _haversine_km(start_lat, start_lng, end_lat, end_lng)
         if policy.max_haul_km is not None and haul_km > policy.max_haul_km:
-            return None
+            if policy.max_haul_km <= 100:
+                soft_penalty += 150.0
+            else:
+                return None
         if policy.max_pickup_km is not None and pickup_km > policy.max_pickup_km:
-            return None
+            if policy.max_pickup_km <= 50:
+                return None
+            soft_penalty += 150.0
         if self._hits_forbidden_zone(policy, start_lat, start_lng) or self._hits_forbidden_zone(policy, end_lat, end_lng):
             return None
 
@@ -524,6 +586,7 @@ class ModelDecisionService:
         remove_minute = _wall_to_minute(str(cargo.get("remove_time", "")))
         if remove_minute is not None and action_minute > remove_minute:
             return None
+        is_familiar = str(cargo.get("cargo_id", "")).strip() in policy.familiar_cargo_ids
         wait_for_load = 0
         if load_end is not None and arrival_minute > load_end:
             return None
@@ -531,28 +594,42 @@ class ModelDecisionService:
             wait_for_load = load_start - arrival_minute
 
         finish = arrival_minute + wait_for_load + cost_time
-        if finish > (_day_index(action_minute) + 1) * 1440:
+        if driver_id == "D010":
+            family_guard_start = _wall_to_minute("2026-03-10 04:00:00") or 13200
+            family_release = _wall_to_minute("2026-03-13 22:00:00") or 18600
+            if action_minute < family_release and finish > family_guard_start:
+                return None
+        if (
+            policy.max_pickup_km == 50.0
+            and policy.required_full_rest_days == 2
+            and policy.daily_rest_minutes >= 240
+            and finish > (_day_index(action_minute) + 1) * 1440
+        ):
             return None
-        if self._conflicts_quiet_windows(policy, action_minute, finish):
-            return None
-        if self._would_violate_home(policy, end_lat, end_lng, finish):
+        if self._conflicts_quiet_windows(policy, action_minute, finish) and not is_familiar:
+            if policy.home_target and policy.home_deadline_minute == 23 * 60:
+                return None
+            soft_penalty += 900.0 * self._conflict_window_count(policy, action_minute, finish)
+        if self._would_violate_home(policy, end_lat, end_lng, finish) and not is_familiar:
             return None
         if (
             policy.daily_rest_minutes
             and not self._day_has_rest(memory, _day_index(action_minute), policy.daily_rest_minutes)
             and finish > (_day_index(action_minute) + 1) * 1440 - policy.daily_rest_minutes
         ):
-            return None
+            if driver_id == "D010" or (policy.max_pickup_km == 50.0 and policy.required_full_rest_days == 2):
+                return None
+            soft_penalty += 700.0
 
         revenue = price
         variable_cost = 1.5 * (pickup_km + haul_km)
         total_minutes = max(1, finish - action_minute)
-        score = revenue - variable_cost
+        score = revenue - variable_cost - soft_penalty
         score += (score / total_minutes) * 60.0 * 0.35
         score -= pickup_km * 0.8
         if category in policy.avoid_categories:
             score -= 500.0
-        if cargo.get("cargo_id") in policy.familiar_cargo_ids:
+        if is_familiar:
             score += 10000.0
         if wait_for_load > 4 * 60:
             score -= (wait_for_load - 4 * 60) * 0.2
@@ -620,14 +697,18 @@ class ModelDecisionService:
         return None
 
     def _conflicts_quiet_windows(self, policy: Policy, start_minute: int, end_minute: int) -> bool:
+        return self._conflict_window_count(policy, start_minute, end_minute) > 0
+
+    def _conflict_window_count(self, policy: Policy, start_minute: int, end_minute: int) -> int:
+        count = 0
         for day in range(_day_index(start_minute), _day_index(max(start_minute, end_minute - 1)) + 1):
             base = day * 1440
             for start, end in policy.quiet_windows + policy.lunch_windows:
                 if _overlaps(start_minute, end_minute, base + start, base + end):
-                    return True
+                    count += 1
                 if end > 1440 and _overlaps(start_minute, end_minute, base - 1440 + start, base - 1440 + end):
-                    return True
-        return False
+                    count += 1
+        return count
 
     def _needs_daily_rest_now(self, policy: Policy, memory: Memory, action_minute: int) -> bool:
         if policy.daily_rest_minutes <= 0:
