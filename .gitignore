@@ -1,0 +1,19 @@
+# Python cache/build artifacts
+__pycache__/
+*.py[cod]
+
+# Local/runtime data
+demo_docs_release_20260509/demo/server/data/
+demo_docs_release_20260509/demo/results/
+demo_docs_release_20260509/demo/server/config/config.json
+tmp/
+
+# Release packages and binary documents
+*.zip
+*.rar
+*.7z
+*.tar
+*.tar.gz
+*.pdf
+*.doc
+*.docx
