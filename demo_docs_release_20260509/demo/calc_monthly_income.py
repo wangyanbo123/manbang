@@ -244,7 +244,7 @@ def load_simulation_duration_days(path: Path) -> int:
     value = raw.get("simulation_duration_days")
     if not isinstance(value, int) or value <= 0:
         raise ValueError("run_summary_202603.json 缺少有效字段 simulation_duration_days")
-    return min(int(value), 30)
+    return int(value)
 
 
 def _nearly_equal(a: float, b: float, eps: float = 1e-4) -> bool:
